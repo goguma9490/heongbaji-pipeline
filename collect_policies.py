@@ -423,6 +423,94 @@ def infer_education_target(text: str) -> str:
     return "전체"
 
 
+# 수도권(서울/인천/경기) 판별용 키워드. '경기'는 '경기 활성화'처럼 지역이 아닌
+# 일반 단어로도 흔히 쓰여서, 반드시 '경기도'까지 붙은 경우만 인정한다.
+_CAPITAL_REGION_KEYWORDS = [
+    ("서울", ["서울특별시", "서울시", "서울"]),
+    ("인천", ["인천광역시", "인천시", "인천"]),
+    ("경기", ["경기도"]),
+]
+
+# 수도권이 아닌 지역(주관기관명/본문에 명시된 경우) - 있으면 그 지역으로 확정해서
+# "전국"으로 뭉개지 않고 정확히 걸러낼 수 있게 한다.
+_OTHER_REGION_KEYWORDS = [
+    # 부산/대구/대전/울산/세종/강원은 "~시"/"~도" 풀네임 없이 축약형만 쓰이는
+    # 경우(예: "부산진구 청년 행정인턴", "강원 고성군 청년 취업수당")가 많아서
+    # 축약형도 반드시 포함한다. ('부산'은 '부산진구' 등 모든 부산 산하 구/군
+    # 이름에 접두어로 들어있어서 이 한 단어로 그 구/군까지 전부 잡힌다.)
+    # '광주'만 예외: 경기도 광주시와 혼동될 수 있어 축약형을 넣지 않고
+    # '광주광역시'/'광주시' 풀네임이 있을 때만 전라도 광주로 인정한다.
+    ("부산", ["부산광역시", "부산시", "부산"]),
+    ("대구", ["대구광역시", "대구시", "대구"]),
+    ("광주", ["광주광역시", "광주시"]),
+    ("대전", ["대전광역시", "대전시", "대전"]),
+    ("울산", ["울산광역시", "울산시", "울산"]),
+    ("세종", ["세종특별자치시", "세종시", "세종"]),
+    ("강원", ["강원도", "강원특별자치도", "강원"]),
+    ("충북", ["충청북도", "충북"]),
+    ("충남", ["충청남도", "충남"]),
+    ("전북", ["전라북도", "전북특별자치도", "전북"]),
+    ("전남", ["전라남도", "전남"]),
+    ("경북", ["경상북도", "경북"]),
+    ("경남", ["경상남도", "경남"]),
+    ("제주", ["제주특별자치도", "제주"]),
+]
+
+
+_ALL_REGION_KEYWORDS = _CAPITAL_REGION_KEYWORDS + _OTHER_REGION_KEYWORDS
+
+# 중앙행정기관(부/처/청/위원회) 이름. 이런 기관이 주관하는 사업은 본문에
+# "대구광역시, 대전광역시, 세종... 10만원 지원"처럼 지원금 차등 지급 지역이나
+# "인하대(인천), 경성대(부산)..."처럼 참여 기관을 여러 지역에 걸쳐 나열하는
+# 경우가 많다. 그런 나열 중 본문에서 가장 먼저 등장한 지역 하나만 소관 지역으로
+# 오인하면 안 되므로, 주관기관이 중앙부처로 확인되면 본문 지역명 검사 없이
+# 곧바로 '전국'으로 처리한다.
+_CENTRAL_MINISTRY_NAMES = {
+    "고용노동부", "교육부", "보건복지부", "여성가족부", "문화체육관광부",
+    "국토교통부", "중소벤처기업부", "기획재정부", "산업통상자원부",
+    "농림축산식품부", "과학기술정보통신부", "행정안전부", "국가보훈부",
+    "통일부", "외교부", "국방부", "법무부", "환경부", "해양수산부",
+    "식품의약품안전처", "병무청", "특허청", "통계청", "관세청", "국세청",
+    "산림청", "기상청", "경찰청", "소방청", "금융위원회", "공정거래위원회",
+    "국민권익위원회", "방송통신위원회", "개인정보보호위원회",
+}
+
+
+def infer_region_from_ontong(organization: Optional[str], text: str) -> str:
+    """온통청년 API 응답에는 명시적인 지역 코드 필드가 없어서, 주관기관명과
+    본문(제목+설명 등) 텍스트에 특정 시/도 이름이 나오는지로 지역을 추정한다.
+
+    주관기관명을 본문 앞에 붙여 하나의 문자열로 합친 뒤, 그 안에서 "가장 먼저
+    (왼쪽에서부터) 등장하는" 지역 키워드를 채택한다. 수도권 키워드를 항상
+    먼저 검사하던 이전 방식은, 예를 들어 '충남학사관 운영 - 충남출신 대학생
+    대상 ... 충청남도서울학사관(서울특별시 ...) 운영'처럼 실제 소관 지역(충남)이
+    본문 앞쪽에 나오고 수도권 지명은 시설 주소 등으로 뒤쪽에만 잠깐 등장하는
+    경우를, 뒤쪽의 수도권 지명 때문에 '서울'로 잘못 분류하는 문제가 있었다.
+    정책 제목/소개는 관례적으로 소관 지역을 맨 앞에 명시하는 경우가 많아서,
+    "가장 먼저 등장하는 지역명"이 실제 소관 지역일 가능성이 가장 높다.
+    아무 지역명도 안 나오면 특정 지자체가 아닌 중앙부처 등이 운영하는 진짜
+    전국 단위 정책으로 보고 '전국'을 반환한다.
+    """
+    if organization and organization.strip() in _CENTRAL_MINISTRY_NAMES:
+        return "전국"
+
+    combined = f"{organization or ''} {text or ''}"
+    if not combined.strip():
+        return "전국"
+
+    best_pos: Optional[int] = None
+    best_label: Optional[str] = None
+    for label, keywords in _ALL_REGION_KEYWORDS:
+        for kw in keywords:
+            pos = combined.find(kw)
+            if pos == -1:
+                continue
+            if best_pos is None or pos < best_pos:
+                best_pos = pos
+                best_label = label
+    return best_label or "전국"
+
+
 # ============================================================
 # 3. 수집기 (requests + BeautifulSoup)  (요구사항 1)
 # ============================================================
@@ -464,7 +552,10 @@ class OntongYouthCollector(BaseCollector):
     """
 
     source_name = "ontong_youth"
-    LIST_URL = "https://www.youthcenter.go.kr/opi/youthPlcyList.do"
+    # 2026-07 신규 API 규격으로 엔드포인트/파라미터명이 변경됨.
+    # (구) https://www.youthcenter.go.kr/opi/youthPlcyList.do?openApiVlak=&display=&pageIndex=
+    # (신) https://www.youthcenter.go.kr/go/ythip/getPlcy?apiKeyNm=&pageSize=&pageNum=
+    LIST_URL = "https://www.youthcenter.go.kr/go/ythip/getPlcy"
 
     def __init__(self, api_key: str | None = None, page_size: int = 100):
         self.api_key = api_key or ONTONG_API_KEY
@@ -472,9 +563,9 @@ class OntongYouthCollector(BaseCollector):
 
     def fetch_page(self, page_index: int) -> tuple[list[dict], int]:
         params = {
-            "openApiVlak": self.api_key,
-            "display": self.page_size,
-            "pageIndex": page_index,
+            "apiKeyNm": self.api_key,
+            "pageSize": self.page_size,
+            "pageNum": page_index,
             "rtnType": "json",
         }
         resp = http_get(self.LIST_URL, params=params)
@@ -514,7 +605,16 @@ class OntongYouthCollector(BaseCollector):
         description = pick("plcyExplnCn", "polyItcnCn", "description") or ""
         support_content = pick("plcySprtCn", "sportContent") or ""
         organization = pick("sprvsnInstCdNm", "operInstCdNm", "rgtrInstCdNm")
-        category = pick("lclsfNm", "mclsfNm", "plcyKywdNm")
+        # 온통청년 API 자체의 대분류명(lclsfNm 등)은 "복지문화", "참여권리"처럼
+        # 우리 서비스의 5개 관심분야(일자리/주거/금융/교육/문화)와 글자 그대로
+        # 일치하지 않는 경우가 있어, 그대로 쓰면 해당 정책이 관심분야 필터·
+        # 적합도 매칭에서 통째로 빠진다. 제목+본문 키워드 추론을 우선 적용하고,
+        # 키워드로 못 찾을 때만 API 원본 대분류명을 그대로 둔다(최종적으로 못
+        # 찾으면 DB 저장/프론트엔드 양쪽에서 '기타'로 처리됨).
+        raw_category = pick("lclsfNm", "mclsfNm", "plcyKywdNm")
+        category = infer_category(
+            f"{title} {description} {support_content}"
+        ) or raw_category
         apply_period_raw = pick("aplyYmd", "rqutPrdCn") or ""
         income_field_raw = pick("earnEtcCn")
 
@@ -576,7 +676,7 @@ class OntongYouthCollector(BaseCollector):
             apply_start_date=start_date,
             apply_end_date=deadline,
             apply_period_raw=apply_period_raw,
-            region="전국",
+            region=infer_region_from_ontong(organization, f"{title} {combined_text}"),
             documents=documents,
         )
 
@@ -872,6 +972,26 @@ def upsert_policy_documents(client: "Client", records: list[PolicyRecord], batch
     return len(rows)
 
 
+def delete_policies_by_id(client: "Client", policy_ids: list[str], batch_size: int = 200) -> int:
+    """주어진 policy_id들을 Policy_Document -> Policy 순으로 삭제한다.
+
+    이번 실행에서 "수도권(전국/서울/인천/경기)이 아닌 지역"으로 새로 확인된
+    정책들을 DB에서도 정리하기 위한 함수. upsert는 이번 배치에 없는 policy_id는
+    건드리지 않기 때문에, 과거(예: 지역 추정 로직 적용 전)에 '전국'으로 잘못
+    들어가 있던 지방 전용 정책이 계속 남아있을 수 있다 - 이 함수가 그걸 지운다.
+    """
+    if not policy_ids:
+        return 0
+    pk_col = POLICY_COLUMNS["policy_id"]
+    fk_col = POLICY_DOCUMENT_COLUMNS["policy_id"]
+    for i in range(0, len(policy_ids), batch_size):
+        chunk = policy_ids[i : i + batch_size]
+        client.table(POLICY_DOCUMENT_TABLE).delete().in_(fk_col, chunk).execute()
+        client.table(POLICY_TABLE).delete().in_(pk_col, chunk).execute()
+        logger.info("수도권 외 지역 정책 삭제 %d~%d / %d건 완료", i + 1, i + len(chunk), len(policy_ids))
+    return len(policy_ids)
+
+
 # ============================================================
 # 5. 메인 파이프라인
 # ============================================================
@@ -898,6 +1018,19 @@ def run() -> None:
         logger.warning("수집된 정책이 없습니다. 종료합니다.")
         return
 
+    # 서비스 범위를 수도권(서울/인천/경기)으로 한정. '전국' 단위 정책까지 포함하면
+    # 양이 너무 많아져서, 특정 지자체(수도권) 전용 정책만 남기고 '전국'을 포함한
+    # 다른 모든 지역은 제외한다.
+    ALLOWED_REGIONS = {"서울", "인천", "경기"}
+    before_count = len(all_records)
+    excluded_records = [r for r in all_records if r.region not in ALLOWED_REGIONS]
+    all_records = [r for r in all_records if r.region in ALLOWED_REGIONS]
+    logger.info(
+        "수도권(서울/인천/경기) 외 지역 정책 %d건 제외, 남은 %d건",
+        before_count - len(all_records),
+        len(all_records),
+    )
+
     # 같은 policy_id가 여러 페이지에서 중복으로 수집될 수 있으므로,
     # Supabase에 보내기 전에 policy_id 기준으로 중복을 한 번 제거한다(마지막 값만 유지).
     dedup: dict[str, PolicyRecord] = {}
@@ -910,6 +1043,14 @@ def run() -> None:
     n_policies = upsert_policies(client, all_records)
     n_docs = upsert_policy_documents(client, all_records)
     logger.info("완료: Policy %d건, Policy_Document %d건 upsert", n_policies, n_docs)
+
+    # upsert는 "이번 배치에 포함된 policy_id"만 건드리기 때문에, 과거 실행에서
+    # (지역 추정 로직 적용 전) '전국'으로 잘못 저장된 뒤 이번에 수도권 외 지역으로
+    # 새로 확인된 정책들은 DB에 그대로 남아있을 수 있다. 그 stale 데이터를 정리한다.
+    excluded_ids = sorted({r.policy_id for r in excluded_records})
+    if excluded_ids:
+        n_deleted = delete_policies_by_id(client, excluded_ids)
+        logger.info("수도권 외 지역으로 확인되어 DB에서 삭제한 정책: %d건", n_deleted)
 
 
 # ============================================================
