@@ -303,6 +303,29 @@ _DOC_ITEM_SPLIT_RE = re.compile(r"(?:^|\s)(?:[①-⑩]|\d{1,2}\s*[.)]|[-·•‣
 _DOC_REQUIRED_TAG_SPLIT_RE = re.compile(r"(?<=\((?:필수|선택)\))\s*(?=\S)")
 
 
+def _split_top_level(value: str, seps: str) -> list[str]:
+    """괄호(/중괄호/대괄호) 안에 있지 않은(= 깊이 0인) 위치의 구분자에서만
+    쪼갠다. 예: '미과세증명서(과세년도:2024~2026년, 자치단체:전국)'처럼
+    서류명 조건을 설명하는 괄호 안의 쉼표까지 서류 구분자로 잘못 쪼개버리는
+    것을 막기 위함 - 그 쉼표는 한 서류명 안의 세부조건 나열일 뿐 다른
+    서류와의 구분자가 아니다."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in value:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if depth == 0 and ch in seps:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+
 def _split_document_items(value: str) -> list[str]:
     """이미 '~서류' 라벨에서 값만 떼어낸 문자열(라벨 자체는 포함되어 있지
     않음)을 항목 리스트로 분리한다. extract_required_documents()는 라벨
@@ -313,7 +336,9 @@ def _split_document_items(value: str) -> list[str]:
     번호/불릿(①② , 1. 2) , ·‣) 우선 분리 후 안 나뉘면 쉼표/줄바꿈 기준으로
     분리하고, 그래도 여러 서류명이 한 항목에 붙어있으면(불릿 없이
     '여권사본(필수) 통장사본(선택)'처럼 나열된 경우) '(필수)'/'(선택)' 표시
-    뒤에서 한 번 더 쪼갠다."""
+    뒤에서, 그래도 안 나뉘면 괄호 밖(최상위) 쉼표 기준으로 한 번 더 쪼갠다
+    (예: '대학생 : 온라인 신청서, 주민등록등본(...), 교육비 납입증명서'처럼
+    대상군 라벨 뒤에 쉼표로만 나열된 경우)."""
     value = (value or "").strip()
     if not value:
         return []
@@ -322,25 +347,46 @@ def _split_document_items(value: str) -> list[str]:
         cleaned = [re.sub(r"\s+", " ", p).strip(" .,") for p in parts]
         return [p for p in cleaned if p and len(p) > 1]
 
+    def _refine_one(it: str) -> list[str]:
+        tag_parts = _clean(_DOC_REQUIRED_TAG_SPLIT_RE.split(it))
+        if len(tag_parts) > 1:
+            result: list[str] = []
+            for p in tag_parts:
+                result.extend(_refine_one(p))
+            return result
+        # 괄호 밖 쉼표가 하나라도 있으면(=괄호 안 세부조건이 아니라 서류명을
+        # 나열하는 쉼표일 가능성이 높으면) 그 기준으로도 나눠본다.
+        top_level = _clean(_split_top_level(it, ","))
+        if len(top_level) > 1:
+            return top_level
+        return [it]
+
     items = _clean(_DOC_ITEM_SPLIT_RE.split(value))
 
     if len(items) <= 1:
         # 번호/불릿이 없으면 '(필수)'/'(선택)' 표시 뒤에서 먼저 재시도한다.
         # 쉼표로 먼저 쪼개면 서류명 괄호 안에 쉼표가 들어있는 경우(예:
         # '미과세증명서(과세년도:2024~2026년, 자치단체:전국)')에 그 안쪽
-        # 까지 잘못 쪼개져버리는 문제가 있어서, 쉼표 분리는 최후의 수단으로
-        # 만 쓴다.
+        # 까지 잘못 쪼개져버리는 문제가 있어서, 쉼표 분리는 (괄호 밖만 보는
+        # 방식으로) 최후의 수단으로만 쓴다.
         tag_items = _clean(_DOC_REQUIRED_TAG_SPLIT_RE.split(value))
         if len(tag_items) > 1:
-            return tag_items
-        return _clean(re.split(r"[,\n·]", value))
+            items = tag_items
+        else:
+            return _clean(_split_top_level(value, ",\n·"))
+    else:
+        items_after_tag = []
+        for it in items:
+            parts = _clean(_DOC_REQUIRED_TAG_SPLIT_RE.split(it))
+            items_after_tag.extend(parts if len(parts) > 1 else [it])
+        items = items_after_tag
 
-    # 번호/불릿으로 이미 나뉜 경우에도, 한 항목 안에 여러 서류명이 불릿 없이
-    # '(필수)'/'(선택)' 표시만으로 나열돼 있을 수 있어 한 번 더 쪼갠다.
+    # 번호/불릿/태그로 이미 나뉜 항목이라도, 그 안에 괄호 밖 쉼표로 여러
+    # 서류명이 나열돼 있을 수 있어(예: 대상군 라벨 뒤 쉼표 나열) 한 번 더
+    # 확인한다.
     refined: list[str] = []
     for it in items:
-        parts = _clean(_DOC_REQUIRED_TAG_SPLIT_RE.split(it))
-        refined.extend(parts if len(parts) > 1 else [it])
+        refined.extend(_refine_one(it))
     return refined
 
 
