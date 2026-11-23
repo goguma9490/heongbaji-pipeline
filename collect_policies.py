@@ -197,7 +197,7 @@ def _safe_int(value) -> Optional[int]:
 
 _SEP = r"(?:[~\-–—∼～]|부터)"
 
-_AGE_RANGE_RE = re.compile(rf"만?\s*(\d{{1,2}})\s*세\s*{_SEP}\s*(\d{{1,2}})\s*세?")
+_AGE_RANGE_RE = re.compile(rf"만?\s*(\d{{1,2}})\s*세\s*{_SEP}\s*만?\s*(\d{{1,2}})\s*세?")
 _AGE_MAX_ONLY_RE = re.compile(r"만?\s*(\d{1,2})\s*세\s*(?:이하|미만|까지)")
 _AGE_MIN_ONLY_RE = re.compile(r"만?\s*(\d{1,2})\s*세\s*(?:이상|부터)")
 
@@ -707,19 +707,36 @@ class OntongYouthCollector(BaseCollector):
 class SeoulYouthPortalCollector(BaseCollector):
     """서울시 청년몽땅정보통(youth.seoul.go.kr) HTML 스크레이핑 수집기.
 
-    TODO: LIST_ITEM_SELECTOR / TITLE_SELECTOR 는 실제 배포 전 브라우저
-    개발자도구(F12 > Elements)에서 목록 카드의 class 명을 확인해 맞춰주세요.
-    셀렉터가 조금 어긋나도 상세 페이지는 전체 텍스트를 정규식 추출기에 넘기므로
-    나이/소득/마감일/구비서류 추출 자체는 계속 동작합니다.
+    목록: /infoData/plcyInfo/list.do?key=2309150002&pageIndex=N (GET, '서울시 정책' 탭)
+    상세: /infoData/plcyInfo/view.do?key=2309150002&tabKind=001&plcyBizId=<ID> (GET)
+
+    (2026-11 기준, 브라우저 개발자도구로 실제 구조 확인 후 셀렉터를 맞춤)
+    목록의 정책 카드는 href가 아니라 onclick="goView('<ID>')" 자바스크립트 호출로
+    상세 페이지로 이동하는 구조라서, href 대신 onclick에서 정규식으로 plcyBizId를
+    뽑아 상세 URL을 직접 구성한다. (goView()가 내부적으로 폼을 GET으로
+    view.do에 제출하는 것을 그대로 흉내낸 것 — 실제 브라우저에서 동일한 GET
+    URL로 상세 페이지가 정상적으로 열리는 것을 확인함.)
+
+    상세 페이지는 <th>라벨</th><td>값</td> 형태의 표로 구성되어 있어서, 전체
+    본문을 정규식으로 긁는 대신 라벨 기준으로 바로 값을 읽어온다(연령/
+    사업신청기간/제출서류/신청 사이트/정책 유형 등 전부 표 안에 있음). 단, 한
+    <tr> 안에 라벨/값 쌍이 두 개 들어있는 행도 있어서(예: '사업운영기간'|''|
+    '사업신청기간'|'20260301 ~ 20261130') tr 단위로 첫 th/td만 보면 안 되고,
+    문서 전체의 모든 th를 순회하며 각자의 바로 다음 형제 td를 찾아야 한다.
     """
 
     source_name = "seoul_youth_portal"
     BASE_URL = "https://youth.seoul.go.kr"
     LIST_URL = BASE_URL + "/infoData/plcyInfo/list.do"
-    LIST_KEY = "2309150002"  # 목록 페이지 식별용 쿼리 파라미터(사이트 구조상 고정값)
+    VIEW_URL = BASE_URL + "/infoData/plcyInfo/view.do"
+    LIST_KEY = "2309150002"  # 목록/상세 페이지 식별용 쿼리 파라미터(사이트 구조상 고정값)
 
-    LIST_ITEM_SELECTOR = "ul.plcyListWrap > li, div.plcyList .card, .board-list li"  # TODO 확인
-    TITLE_SELECTOR = "a.tit, .tit a, a"
+    LIST_ITEM_SELECTOR = "ul.policy-list > li"
+    TITLE_SELECTOR = "a.tit"
+
+    _GOVIEW_ID_RE = re.compile(r"goView\('([^']+)'\)")
+    _PLCY_BIZ_ID_IN_HREF_RE = re.compile(r"plcyBizId=(\w+)")
+    _YMD_RANGE_RE = re.compile(r"(\d{8})\s*~\s*(\d{8})")
 
     def __init__(self, max_pages: int = 3):
         self.max_pages = max_pages
@@ -731,39 +748,151 @@ class SeoulYouthPortalCollector(BaseCollector):
         links: list[tuple[str, str]] = []
         for it in items:
             a = it.select_one(self.TITLE_SELECTOR) or it.find("a")
-            if not a or not a.get("href"):
+            if not a:
                 continue
-            href = a["href"]
             title = a.get_text(strip=True)
-            if href.startswith("javascript"):
+
+            plcy_biz_id = None
+            m = self._GOVIEW_ID_RE.search(a.get("onclick") or "")
+            if m:
+                plcy_biz_id = m.group(1)
+            else:
+                # 혹시 사이트 개편으로 onclick 대신 href에 id가 직접 들어오는
+                # 경우를 대비한 대비책.
+                m2 = self._PLCY_BIZ_ID_IN_HREF_RE.search(a.get("href") or "")
+                if m2:
+                    plcy_biz_id = m2.group(1)
+
+            if not plcy_biz_id:
                 continue
-            detail_url = href if href.startswith("http") else self.BASE_URL + href
-            links.append((title, detail_url))
+            links.append((title, plcy_biz_id))
         return links
 
-    def fetch_detail(self, title: str, url: str) -> PolicyRecord:
-        resp = http_get(url)
+    @staticmethod
+    def _parse_labeled_rows(soup: BeautifulSoup) -> dict[str, str]:
+        """상세 페이지의 <th>라벨</th><td>값</td> 표를 {라벨: 값} 딕셔너리로 변환."""
+        rows: dict[str, str] = {}
+        for th in soup.select("table th"):
+            td = th.find_next_sibling("td")
+            if td is None:
+                continue
+            label = th.get_text(strip=True)
+            value = td.get_text(" ", strip=True)
+            if label:
+                rows[label] = value
+        return rows
+
+    @staticmethod
+    def _split_document_list_value(value: str) -> list[str]:
+        """이미 '제출서류' 라벨에서 값만 떼어낸 문자열(라벨 자체는 포함되어
+        있지 않음)을 항목 리스트로 분리한다. extract_required_documents()는
+        라벨 글자를 먼저 찾아 그 뒤 섹션을 자르는 방식이라 라벨이 없는 값
+        자체에는 쓸 수 없어서, 번호/불릿(①② , 1. 2) , ·‣) 우선 분리 후 안
+        나뉘면 쉼표/줄바꿈 기준으로 분리하는 전용 로직을 쓴다."""
+        value = (value or "").strip()
+        if not value:
+            return []
+
+        raw_items = _DOC_ITEM_SPLIT_RE.split(value)
+        items = [re.sub(r"\s+", " ", it).strip(" .,") for it in raw_items]
+        items = [it for it in items if it and len(it) > 1]
+        if len(items) > 1:
+            return items
+
+        # 번호/불릿이 없으면 쉼표·가운뎃점·줄바꿈 기준으로 재시도.
+        raw_items = re.split(r"[,\n·]", value)
+        items = [re.sub(r"\s+", " ", it).strip(" .,") for it in raw_items]
+        items = [it for it in items if it and len(it) > 1]
+        return items
+
+    def fetch_detail(self, title: str, plcy_biz_id: str) -> PolicyRecord:
+        resp = http_get(
+            self.VIEW_URL,
+            params={"key": self.LIST_KEY, "tabKind": "001", "plcyBizId": plcy_biz_id},
+        )
         soup = BeautifulSoup(resp.text, "html.parser")
+        rows = self._parse_labeled_rows(soup)
         body_text = soup.get_text("\n", strip=True)
 
-        min_age, max_age = extract_age_range(body_text)
-        max_income, income_raw = extract_max_income(body_text)
-        deadline = extract_deadline(body_text)
-        documents = extract_required_documents(body_text)
+        description = rows.get("정책 소개") or ""
+        support_content = rows.get("지원 내용") or ""
+        raw_category = rows.get("정책 유형")
+        organization = rows.get("운영기관") or rows.get("주관 기관")
 
-        policy_id = "seoul-" + hashlib.md5(url.encode()).hexdigest()[:12]
+        age_text = rows.get("연령") or ""
+        combined_text = " ".join(
+            x
+            for x in [
+                title,
+                description,
+                support_content,
+                age_text,
+                rows.get("학력"),
+                rows.get("취업상태"),
+                rows.get("추가단서 사항"),
+                rows.get("참여제한 대상"),
+            ]
+            if x
+        )
+
+        category = infer_category(f"{title} {description} {support_content}") or raw_category
+
+        min_age, max_age = extract_age_range(age_text)
+        if min_age is None and max_age is None:
+            min_age, max_age = extract_age_range(combined_text)
+
+        max_income, income_condition_raw = extract_max_income(combined_text)
+
+        apply_period_raw = rows.get("사업신청기간") or rows.get("사업운영기간") or ""
+        start_date = None
+        deadline = None
+        m = self._YMD_RANGE_RE.search(apply_period_raw)
+        if m:
+            s, e = m.group(1), m.group(2)
+            start_date = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+            deadline = f"{e[:4]}-{e[4:6]}-{e[6:8]}"
+        if not deadline:
+            deadline = extract_deadline(apply_period_raw) or extract_deadline(body_text)
+
+        # 주의: '제출서류' 칸이 비어있을 때 body_text(페이지 전체 텍스트) regex로
+        # 대체 추출을 시도하면 안 된다 - body_text에도 '제출서류'라는 라벨
+        # 글자 자체는 항상 존재해서(표에 빈 칸으로라도 찍힘) extract_required_
+        # documents()가 그 뒤의 '신청 사이트/기타/운영기관...' 같은 무관한 표
+        # 내용을 통째로 한 항목으로 잘못 집어오는 문제가 있었다(실제 테스트로
+        # 확인됨). 이미 라벨로 값만 분리된 상태이므로, 그 값 자체를 번호/불릿/
+        # 쉼표 기준으로만 나눈다. 값이 비어있으면 빈 리스트(=이 정책은 제출서류
+        # 정보가 없음 - 프론트엔드에 이미 있는 안내 문구로 처리됨).
+        documents = self._split_document_list_value(rows.get("제출서류") or "")
+
+        support_amount = extract_support_amount(support_content) or extract_support_amount(body_text)
+        target_employment = infer_employment_target(rows.get("취업상태") or combined_text)
+        target_education = infer_education_target(rows.get("학력") or combined_text)
+
+        apply_url = rows.get("신청 사이트") or rows.get("참고 사이트 Ⅰ")
+        detail_url = resp.url
+        source_url = apply_url if apply_url and apply_url.startswith("http") else detail_url
+
+        policy_id = "seoul-" + hashlib.md5(plcy_biz_id.encode()).hexdigest()[:12]
         return PolicyRecord(
             policy_id=policy_id,
             source=self.source_name,
             title=title or "(제목없음)",
-            source_url=url,
-            region="서울",
-            description=body_text[:1000],
+            source_url=source_url,
+            category=category,
+            organization=organization,
+            description=description or body_text[:1000],
+            support_content=support_content,
             min_age=min_age,
             max_age=max_age,
-            income_condition_raw=income_raw,
+            income_condition_raw=income_condition_raw,
             max_income=max_income,
+            support_amount=support_amount,
+            target_employment=target_employment,
+            target_education=target_education,
+            apply_start_date=start_date,
             apply_end_date=deadline,
+            apply_period_raw=apply_period_raw,
+            region="서울",
             documents=documents,
         )
 
@@ -777,11 +906,11 @@ class SeoulYouthPortalCollector(BaseCollector):
                 break
             if not links:
                 break
-            for title, url in links:
+            for title, plcy_biz_id in links:
                 try:
-                    records.append(self.fetch_detail(title, url))
+                    records.append(self.fetch_detail(title, plcy_biz_id))
                 except Exception:
-                    logger.exception("서울 청년포털 상세 파싱 실패: %s", url)
+                    logger.exception("서울 청년포털 상세 파싱 실패: %s / %s", title, plcy_biz_id)
                 time.sleep(REQUEST_DELAY_SEC)
             logger.info("서울 청년포털 %d페이지 수집 완료 (누적 %d건)", page, len(records))
         return records
