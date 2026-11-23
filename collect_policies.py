@@ -286,18 +286,77 @@ def extract_deadline(text: str) -> Optional[str]:
     return max(dates).isoformat()
 
 
+_DOC_LABEL_RE = r"(?:추진|구비|제출|첨부|준비|필요|신청|증빙)\s*서류"
+# 라벨 뒤에 (a) 콜론이 바로 오거나, (b) 콜론 없이 바로 줄바꿈/불릿/번호가
+# 오는 경우만 '서류 목록 섹션의 시작'으로 인정한다([ \t]*로 공백/탭만
+# 건너뛰고 줄바꿈은 건너뛰지 않음에 주의 - 그래야 '라벨\n- 항목' 형태도
+# 놓치지 않는다). 그 외의 경우(라벨 뒤에 공백만 두고 다른 낱말이 바로
+# 오는 경우, 예: '제출서류 유의사항 안내')는 라벨이 서류 목록 헤더가
+# 아니라 다른 문장(안내문 등) 속에 우연히 섞여 있는 것으로 보고 건너뛴다.
 _DOC_SECTION_RE = re.compile(
-    r"(?:구비\s*서류|제출\s*서류|첨부\s*서류)\s*[:：]?\s*(.+?)"
-    r"(?=(?:\n\s*\n)|신청\s*방법|문의\s*처|접수\s*방법|접수\s*기간|유의\s*사항|담당\s*부서|$)",
+    rf"{_DOC_LABEL_RE}[ \t]*(?:[:：][ \t]*|(?=\n|[-·•‣]|[①-⑩]|\d{{1,2}}\s*[.)]))(.+?)"
+    r"(?=(?:\n\s*\n)|신청\s*방법|문의\s*처|접수\s*방법|접수\s*기간|유의\s*사항|"
+    r"담당\s*부서|기타\s*안내|추진\s*절차|결과\s*통보|※|$)",
     re.S,
 )
 _DOC_ITEM_SPLIT_RE = re.compile(r"(?:^|\s)(?:[①-⑩]|\d{1,2}\s*[.)]|[-·•‣])\s*")
+_DOC_REQUIRED_TAG_SPLIT_RE = re.compile(r"(?<=\((?:필수|선택)\))\s*(?=\S)")
+
+
+def _split_document_items(value: str) -> list[str]:
+    """이미 '~서류' 라벨에서 값만 떼어낸 문자열(라벨 자체는 포함되어 있지
+    않음)을 항목 리스트로 분리한다. extract_required_documents()는 라벨
+    글자를 먼저 찾아 그 뒤 섹션을 자르는 방식이라 라벨이 없는 값 자체에는
+    쓸 수 없어서(예: 온통청년 API의 'sbmsnDcmntCn' 필드는 이미 서류 목록만
+    떼어져 있고 '제출서류' 같은 라벨 글자가 없음 - 이걸 extract_required_
+    documents()에 그대로 넣으면 라벨을 못 찾아서 빈 리스트가 되어버렸다),
+    번호/불릿(①② , 1. 2) , ·‣) 우선 분리 후 안 나뉘면 쉼표/줄바꿈 기준으로
+    분리하고, 그래도 여러 서류명이 한 항목에 붙어있으면(불릿 없이
+    '여권사본(필수) 통장사본(선택)'처럼 나열된 경우) '(필수)'/'(선택)' 표시
+    뒤에서 한 번 더 쪼갠다."""
+    value = (value or "").strip()
+    if not value:
+        return []
+
+    def _clean(parts: list[str]) -> list[str]:
+        cleaned = [re.sub(r"\s+", " ", p).strip(" .,") for p in parts]
+        return [p for p in cleaned if p and len(p) > 1]
+
+    items = _clean(_DOC_ITEM_SPLIT_RE.split(value))
+
+    if len(items) <= 1:
+        # 번호/불릿이 없으면 '(필수)'/'(선택)' 표시 뒤에서 먼저 재시도한다.
+        # 쉼표로 먼저 쪼개면 서류명 괄호 안에 쉼표가 들어있는 경우(예:
+        # '미과세증명서(과세년도:2024~2026년, 자치단체:전국)')에 그 안쪽
+        # 까지 잘못 쪼개져버리는 문제가 있어서, 쉼표 분리는 최후의 수단으로
+        # 만 쓴다.
+        tag_items = _clean(_DOC_REQUIRED_TAG_SPLIT_RE.split(value))
+        if len(tag_items) > 1:
+            return tag_items
+        return _clean(re.split(r"[,\n·]", value))
+
+    # 번호/불릿으로 이미 나뉜 경우에도, 한 항목 안에 여러 서류명이 불릿 없이
+    # '(필수)'/'(선택)' 표시만으로 나열돼 있을 수 있어 한 번 더 쪼갠다.
+    refined: list[str] = []
+    for it in items:
+        parts = _clean(_DOC_REQUIRED_TAG_SPLIT_RE.split(it))
+        refined.extend(parts if len(parts) > 1 else [it])
+    return refined
 
 
 def extract_required_documents(text: str) -> list[str]:
-    """본문의 '구비서류' / '제출서류' / '첨부서류' 섹션을 찾아 항목 리스트로 분리한다.
+    """본문에서 '~서류' 라벨(구비서류/제출서류/첨부서류/추진서류/신청서류/
+    준비서류/필요서류/증빙서류 등) 섹션을 찾아 항목 리스트로 분리한다.
 
-    번호(1. 2. / ①② ) 또는 불릿(-, ·, •), 줄바꿈 등 여러 표기를 모두 지원한다.
+    라벨 뒤에 콜론이 바로 오거나, 콜론 없이 바로 줄바꿈/불릿/번호가 오는
+    경우만 '서류 목록 섹션의 시작'으로 인정한다 (예전에는 이 조건이 전혀
+    없어서, 본문 중간에 전혀 무관한 문장 안에 라벨 글자가 우연히 들어있는
+    경우까지 섹션 시작으로 오인해서 그 뒤의 전혀 무관한 텍스트를 통째로
+    '서류 목록'으로 잘못 캡처하는 문제가 있었다 - 예: '※ 제출서류
+    유의사항 안내 : 모든 서류는 PDF로 제출'은 서류 목록이 아니라 서류
+    제출 방법에 대한 안내문인데, 라벨 글자 '제출서류' 뒤에 공백만 두고
+    다른 낱말('유의사항')이 바로 이어진다는 걸 구분하지 못해서 잘못
+    매칭됐었다).
     """
     if not text:
         return []
@@ -306,16 +365,8 @@ def extract_required_documents(text: str) -> list[str]:
     if not m:
         return []
 
-    # 줄바꿈을 공백으로 통일한 뒤 번호/불릿 기준으로만 분리한다.
-    # (줄바꿈과 불릿이 함께 있을 때 순서 문제로 불릿이 덜 제거되는 것을 방지)
     section = re.sub(r"[\r\n]+", " ", m.group(1)).strip()
-    raw_items = _DOC_ITEM_SPLIT_RE.split(section)
-    items = []
-    for it in raw_items:
-        it = re.sub(r"\s+", " ", it).strip(" .,")
-        if it and len(it) > 1:
-            items.append(it)
-    return items
+    return _split_document_items(section)
 
 
 # ------------------------------------------------------------------
@@ -655,16 +706,28 @@ class OntongYouthCollector(BaseCollector):
             s = str(start_ymd)
             start_date = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
 
-        documents_source_text = pick("sbmsnDcmntCn") or combined_text
-        documents = extract_required_documents(documents_source_text) or extract_required_documents(
-            combined_text
+        # 온통청년 API의 '제출서류' 전용 필드(sbmsnDcmntCn)는 이미 서류
+        # 목록만 떼어져 있어서(라벨 글자 자체가 없음) extract_required_
+        # documents()처럼 라벨을 먼저 찾는 방식을 쓰면 라벨이 없다는 이유로
+        # 못 찾고 빈 리스트가 되어버린다(실제로 전체 수집 정책 중 상당수가
+        # 이 문제로 서류 목록이 비어있었다). 이 필드가 있으면 라벨 탐색 없이
+        # 바로 항목만 분리하고, 없을 때만 본문 전체(combined_text)에서 라벨
+        # 기준으로 찾는다.
+        raw_doc_field = pick("sbmsnDcmntCn")
+        documents = (
+            _split_document_items(raw_doc_field)
+            if raw_doc_field
+            else extract_required_documents(combined_text)
         )
 
         return PolicyRecord(
             policy_id=f"ontong-{raw_id}",
             source=self.source_name,
             title=title,
-            source_url=pick("refUrlAddr1", "aplyUrlAddr") or "https://www.youthcenter.go.kr",
+            # aplyUrlAddr(실제 신청 URL)을 refUrlAddr1(참고/설명 사이트)보다
+            # 우선한다. 예전에는 반대 순서라서, 실제로는 따로 신청 페이지가
+            # 있는 정책도 전부 '참고용 설명 사이트'로만 연결되고 있었다.
+            source_url=pick("aplyUrlAddr", "refUrlAddr1") or "https://www.youthcenter.go.kr",
             category=category,
             organization=organization,
             description=description,
@@ -782,29 +845,6 @@ class SeoulYouthPortalCollector(BaseCollector):
                 rows[label] = value
         return rows
 
-    @staticmethod
-    def _split_document_list_value(value: str) -> list[str]:
-        """이미 '제출서류' 라벨에서 값만 떼어낸 문자열(라벨 자체는 포함되어
-        있지 않음)을 항목 리스트로 분리한다. extract_required_documents()는
-        라벨 글자를 먼저 찾아 그 뒤 섹션을 자르는 방식이라 라벨이 없는 값
-        자체에는 쓸 수 없어서, 번호/불릿(①② , 1. 2) , ·‣) 우선 분리 후 안
-        나뉘면 쉼표/줄바꿈 기준으로 분리하는 전용 로직을 쓴다."""
-        value = (value or "").strip()
-        if not value:
-            return []
-
-        raw_items = _DOC_ITEM_SPLIT_RE.split(value)
-        items = [re.sub(r"\s+", " ", it).strip(" .,") for it in raw_items]
-        items = [it for it in items if it and len(it) > 1]
-        if len(items) > 1:
-            return items
-
-        # 번호/불릿이 없으면 쉼표·가운뎃점·줄바꿈 기준으로 재시도.
-        raw_items = re.split(r"[,\n·]", value)
-        items = [re.sub(r"\s+", " ", it).strip(" .,") for it in raw_items]
-        items = [it for it in items if it and len(it) > 1]
-        return items
-
     def fetch_detail(self, title: str, plcy_biz_id: str) -> PolicyRecord:
         resp = http_get(
             self.VIEW_URL,
@@ -862,7 +902,7 @@ class SeoulYouthPortalCollector(BaseCollector):
         # 확인됨). 이미 라벨로 값만 분리된 상태이므로, 그 값 자체를 번호/불릿/
         # 쉼표 기준으로만 나눈다. 값이 비어있으면 빈 리스트(=이 정책은 제출서류
         # 정보가 없음 - 프론트엔드에 이미 있는 안내 문구로 처리됨).
-        documents = self._split_document_list_value(rows.get("제출서류") or "")
+        documents = _split_document_items(rows.get("제출서류") or "")
 
         support_amount = extract_support_amount(support_content) or extract_support_amount(body_text)
         target_employment = infer_employment_target(rows.get("취업상태") or combined_text)
@@ -954,6 +994,20 @@ class IncheonYouthPortalCollector(BaseCollector):
         resp = http_get(self.DETAIL_URL, params={"poly_seq": poly_seq})
         soup = BeautifulSoup(resp.text, "html.parser")
 
+        # 상세 페이지에는 '신청하기' 버튼(a.btn_join, 실제 신청 접수 폼으로
+        # 연결됨)이 따로 있는데, 지금까지는 이걸 안 보고 그냥 지금 보고 있는
+        # 상세 설명 페이지 자신의 URL(= url)을 신청 링크로 써버리고 있었다.
+        # 버튼이 있으면 그 링크를 쓰고, 없으면(사이트 구조가 바뀐 경우 대비)
+        # 기존처럼 상세 페이지 URL로 대체한다.
+        apply_link_tag = soup.select_one("a.btn_join") or soup.find(
+            "a", href=re.compile(r"AcptReg")
+        )
+        apply_href = apply_link_tag.get("href") if apply_link_tag else None
+        if apply_href:
+            apply_url = apply_href if apply_href.startswith("http") else self.BASE_URL + apply_href
+        else:
+            apply_url = url
+
         title = extract_title_from_title_tag(soup, fallback=f"인천청년정책-{poly_seq}")
         body_text = soup.get_text("\n", strip=True)
         main_content = extract_main_content(body_text)
@@ -976,7 +1030,7 @@ class IncheonYouthPortalCollector(BaseCollector):
             policy_id=f"incheon-{poly_seq}",
             source=self.source_name,
             title=title,
-            source_url=url,
+            source_url=apply_url,
             region="인천",
             category=category,
             description=main_content,
