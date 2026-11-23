@@ -299,7 +299,14 @@ _DOC_SECTION_RE = re.compile(
     r"담당\s*부서|기타\s*안내|추진\s*절차|결과\s*통보|※|$)",
     re.S,
 )
-_DOC_ITEM_SPLIT_RE = re.compile(r"(?:^|\s)(?:[①-⑩]|\d{1,2}\s*[.)]|[-·•‣])\s*")
+# 가)/나)/다)/라)처럼 공문서에 흔한 한글 순번 불릿도 번호/불릿 목록으로
+# 인식한다 (기존에는 ①-⑩/숫자/대시만 인식해서, 이 형식의 서류 안내문이
+# 통째로 하나의 항목으로 뭉쳐서 저장되는 문제가 있었음). "가" 같은 흔한
+# 글자가 아무 단어에나 오인되지 않도록, 반드시 공백 뒤 + 바로 다음에
+# '.'/')'가 와야만(= 그 글자 하나가 통째로 순번 라벨일 때만) 인정한다.
+_DOC_ITEM_SPLIT_RE = re.compile(
+    r"(?:^|\s)(?:[①-⑩]|\d{1,2}\s*[.)]|[-·•‣]|[가나다라마바사아자]\s*[.)])\s*"
+)
 _DOC_REQUIRED_TAG_SPLIT_RE = re.compile(r"(?<=\((?:필수|선택)\))\s*(?=\S)")
 
 
@@ -1175,15 +1182,29 @@ def upsert_policies(client: "Client", records: list[PolicyRecord], batch_size: i
 def upsert_policy_documents(client: "Client", records: list[PolicyRecord], batch_size: int = 200) -> int:
     fk_col = POLICY_DOCUMENT_COLUMNS["policy_id"]
 
-    # 정책별 서류 목록은 재수집 시 최신 상태로 덮어쓰기 위해, 서류가 있는
-    # policy_id에 한해 기존 행을 지우고 다시 insert 합니다.
-    policy_ids_with_docs = list({r.policy_id for r in records if r.documents})
-    if policy_ids_with_docs:
-        client.table(POLICY_DOCUMENT_TABLE).delete().in_(fk_col, policy_ids_with_docs).execute()
+    # ⚠️ 예전에는 "이번 회차에 서류가 1건 이상 뽑힌 policy_id"만 지우고 다시
+    # 썼다. 그런데 추출 로직이 더 엄격해지면서(예: 라벨 뒤에 콜론/줄바꿈/불릿이
+    # 바로 와야만 인정) 어떤 정책은 이번 회차에 0건으로 바뀔 수 있는데, 그
+    # policy_id는 "서류가 있는 목록"에서 빠지니까 예전 회차 때 들어간
+    # (옛날 버그로 뭉쳐지거나 중복된) 행이 영영 안 지워지고 DB에 계속
+    # 남아있는 문제가 있었다. 그래서 이번 회차에 수집된 policy_id는
+    # (서류가 0건이든 아니든) 전부 먼저 지우고 다시 쓴다 - 이번에 0건이면
+    # 정말로 빈 상태로 남아야 맞다.
+    policy_ids_this_run = list({r.policy_id for r in records})
+    if policy_ids_this_run:
+        client.table(POLICY_DOCUMENT_TABLE).delete().in_(fk_col, policy_ids_this_run).execute()
 
     rows = []
     for r in records:
+        # 같은 정책 안에서 완전히 동일한 서류명이 여러 번 들어오는 경우(예:
+        # 대상 구간마다 반복되는 공통 안내문 "기타 증빙자료 추가 제출(필요시)
+        # (선택)")가 있어서, 체크리스트에 같은 항목이 여러 번 중복으로
+        # 보이지 않도록 정책 단위로 중복을 제거한다 (순서는 유지).
+        seen_doc_names: set[str] = set()
         for doc_name in r.documents:
+            if doc_name in seen_doc_names:
+                continue
+            seen_doc_names.add(doc_name)
             row = _map_columns(
                 {
                     "policy_id": r.policy_id,
