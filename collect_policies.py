@@ -1289,6 +1289,63 @@ def run() -> None:
     all_records = list(dedup.values())
     logger.info("중복 제거 후 최종 %d건", len(all_records))
 
+    # 온통청년 API(ontong-*)와 서울/인천 포털 직접 스크레이핑(seoul-*/incheon-*)이
+    # 같은 실제 정책을 각자 따로 수집해서, policy_id만 다르고 내용은 같은
+    # 정책이 중복으로 들어가는 경우가 많았다(실제로 확인해보니 전체 545건 중
+    # 160건/80쌍, 약 29%가 이런 출처 간 중복이었음 - 예: "2026 청년예술청 운영"이
+    # ontong-... 과 seoul-... 두 policy_id로 각각 저장되어 추천 결과에 같은
+    # 정책이 두 번 뜨는 문제가 있었음). policy_id가 서로 다르므로 위 중복
+    # 제거로는 못 잡는다. 제목+지역이 같으면 같은 정책으로 보고, 그 중 "정보가
+    # 더 풍부한" 쪽(①서류 개수 ②채워진 필드 수 ③설명 길이 순으로 비교) 하나만
+    # 남기고 나머지는 버린다.
+    def _richness_score(r: PolicyRecord) -> tuple[int, int, int]:
+        def present(v) -> bool:
+            return v is not None and str(v).strip() != ""
+
+        doc_score = len(r.documents or [])
+        field_score = sum(
+            [
+                present(r.description),
+                present(r.support_content),
+                present(r.organization),
+                r.min_age is not None,
+                r.max_age is not None,
+                r.max_income is not None,
+                present(r.target_employment) and r.target_employment != "전체",
+                present(r.target_education) and r.target_education != "전체",
+                bool(r.apply_end_date),
+                bool(r.support_amount),
+            ]
+        )
+        text_len = len(r.description or "") + len(r.support_content or "")
+        return (doc_score, field_score, text_len)
+
+    title_groups: dict[tuple[str, str], list[PolicyRecord]] = {}
+    for r in all_records:
+        key = (re.sub(r"\s+", " ", r.title or "").strip(), r.region or "")
+        title_groups.setdefault(key, []).append(r)
+
+    cross_source_dropped_ids: list[str] = []
+    deduped_records: list[PolicyRecord] = []
+    for (title_key, region_key), group in title_groups.items():
+        if len(group) == 1:
+            deduped_records.append(group[0])
+            continue
+        group.sort(key=_richness_score, reverse=True)
+        best, *rest = group
+        deduped_records.append(best)
+        cross_source_dropped_ids.extend(r.policy_id for r in rest)
+        logger.info(
+            "출처 간 중복 정책 통합: '%s' (%s) - %s 채택, %s 제외",
+            title_key, region_key, best.policy_id, [r.policy_id for r in rest],
+        )
+    all_records = deduped_records
+    logger.info(
+        "출처 간 제목 중복 제거 후 최종 %d건 (제외 %d건)",
+        len(all_records),
+        len(cross_source_dropped_ids),
+    )
+
     client = get_supabase_client()
     n_policies = upsert_policies(client, all_records)
     n_docs = upsert_policy_documents(client, all_records)
@@ -1296,11 +1353,15 @@ def run() -> None:
 
     # upsert는 "이번 배치에 포함된 policy_id"만 건드리기 때문에, 과거 실행에서
     # (지역 추정 로직 적용 전) '전국'으로 잘못 저장된 뒤 이번에 수도권 외 지역으로
-    # 새로 확인된 정책들은 DB에 그대로 남아있을 수 있다. 그 stale 데이터를 정리한다.
-    excluded_ids = sorted({r.policy_id for r in excluded_records})
+    # 새로 확인된 정책들, 그리고 위에서 출처 간 중복으로 걸러져 이번엔 "탈락한
+    # 쪽" policy_id로 과거에 저장돼 있던 행도 DB에 그대로 남아있을 수 있다.
+    # 둘 다 정리한다.
+    excluded_ids = sorted({r.policy_id for r in excluded_records} | set(cross_source_dropped_ids))
     if excluded_ids:
         n_deleted = delete_policies_by_id(client, excluded_ids)
-        logger.info("수도권 외 지역으로 확인되어 DB에서 삭제한 정책: %d건", n_deleted)
+        logger.info(
+            "수도권 외 지역/출처 간 중복으로 DB에서 삭제한 정책: %d건", n_deleted
+        )
 
 
 # ============================================================
